@@ -1,8 +1,6 @@
 // This is your Prisma schema file,
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
   provider = "prisma-client"
   output   = "../generated/prisma"
@@ -10,4 +8,156 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+}
+
+enum PlanScope {
+  ACCOUNT
+  USER
+}
+
+enum PlanSource {
+  PREDEFINED
+  CUSTOM
+}
+
+// ──────────────────────────────────────────────
+// Plans
+// ──────────────────────────────────────────────
+
+model Plan {
+  id          Int       @id @default(autoincrement())
+  name        String
+  scope       PlanScope
+  monthlyAllowance Int  @default(0)
+  maxPerRequest    Int  @default(0)
+  source      PlanSource @default(CUSTOM)
+  accountId   Int?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  // Inverse side: many accounts can reference this plan.
+  accounts   Account[] @relation("AccountPlan")
+
+  // Inverse side of User.plan relation.
+  users       User[]    @relation("UserPlan")
+
+  @@unique([name, scope, accountId])
+  @@index([scope, source])
+  @@index([accountId])
+}
+
+// ──────────────────────────────────────────────
+// Accounts
+// ──────────────────────────────────────────────
+
+model Account {
+  id          Int       @id @default(autoincrement())
+  name        String
+  apiKeyHash  String    @unique
+  apiKeyPrefix String    @unique // first 8 hex chars of the key, for efficient lookup
+  planId      Int
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  // Many accounts can share the same plan (one-to-many from Plan to Account).
+  plan        Plan      @relation("AccountPlan", fields: [planId], references: [id])
+
+  users       User[]
+  accountUsage AccountUsage[]
+  usageRequests UsageRequest[]
+
+  @@index([planId])
+}
+
+// ──────────────────────────────────────────────
+// Users
+// ──────────────────────────────────────────────
+
+model User {
+  id          Int       @id @default(autoincrement())
+  externalRef String
+  accountId   Int
+  planId      Int
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  account     Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  plan        Plan      @relation("UserPlan", fields: [planId], references: [id])
+
+  userUsage   UserUsage[]
+  usageRequests UsageRequest[]
+
+  @@unique([accountId, externalRef])
+  @@index([accountId])
+  @@index([planId])
+}
+
+// ──────────────────────────────────────────────
+// Monthly usage totals
+// ──────────────────────────────────────────────
+
+model AccountUsage {
+  id          Int       @id @default(autoincrement())
+  accountId   Int
+  year        Int
+  month       Int
+  consumedUnits Int     @default(0)
+
+  account     Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, year, month])
+  @@index([accountId])
+  @@index([year, month])
+}
+
+model UserUsage {
+  id          Int       @id @default(autoincrement())
+  userId      Int
+  year        Int
+  month       Int
+  consumedUnits Int     @default(0)
+
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, year, month])
+  @@index([userId])
+  @@index([year, month])
+}
+
+// ──────────────────────────────────────────────
+// Durable consumption decision log
+// ──────────────────────────────────────────────
+
+model UsageRequest {
+  id                     Int       @id @default(autoincrement())
+  accountId              Int
+  userId                 Int
+  requestId              String
+  requestedUnits         Int
+  accepted               Boolean
+  rejectionCode          String?
+  rejectionScope         String?
+  accountedYear          Int
+  accountedMonth         Int
+  accountPlanId          Int
+  userPlanId             Int
+  accountMaxPerRequest   Int
+  userMaxPerRequest      Int
+  accountMonthlyAllowance Int
+  userMonthlyAllowance   Int
+  accountUsedBefore      Int
+  userUsedBefore         Int
+  accountRemainingBefore Int
+  userRemainingBefore    Int
+  unitsConsumed          Int       @default(0)
+  processedAt            DateTime  @default(now())
+
+  account    Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, requestId])
+  @@index([accountId, accountedYear, accountedMonth])
+  @@index([accountId, processedAt])
+  @@index([userId])
+  @@index([requestId])
 }

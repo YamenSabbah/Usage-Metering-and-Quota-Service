@@ -1,5 +1,5 @@
 // import { prisma } from "./lib/prisma";
-
+export {};
 // async function main() {
 //   // Create a new user with a post
 //   const user = await prisma.user.create({
@@ -10,7 +10,6 @@
 //     },
 //   });
 // }
-
 // main()
 //   .then(async () => {
 //     await prisma.$disconnect();
@@ -20,3 +19,4 @@
 //     await prisma.$disconnect();
 //     process.exit(1);
 //   });
+//# sourceMappingURL=test.js.map
