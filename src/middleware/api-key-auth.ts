@@ -2,6 +2,7 @@ import type { Request, Response, NextFunction } from "express";
 import { prisma } from "../lib/prisma";
 import { verifyApiKey } from "../utils/crypto";
 import { unauthorized } from "./errors";
+import { isCachedVerification, rememberVerification } from "../lib/api-key-cache";
 
 declare global {
   namespace Express {
@@ -22,6 +23,10 @@ export type AuthenticatedRequest = Request;
  *    to enable an efficient indexed lookup.
  *  - We then verify the full plaintext key against the stored argon2id hash.
  *  - This avoids timing attacks and never stores plaintext keys.
+ *
+ * argon2id verification is expensive (~200 ms, 64 MB), so a successful result
+ * is cached bound to the current `apiKeyHash`. The row lookup still happens on
+ * every request, which keeps the hot path correct if the hash is ever rotated.
  */
 export function apiKeyAuth() {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
@@ -41,7 +46,12 @@ export function apiKeyAuth() {
         return next(unauthorized("Invalid API key."));
       }
 
-      const valid = await verifyApiKey(key, row.apiKeyHash);
+      let valid = isCachedVerification(key, row.apiKeyHash);
+      if (!valid) {
+        valid = await verifyApiKey(key, row.apiKeyHash);
+        if (valid) rememberVerification(key, row.apiKeyHash);
+      }
+
       if (!valid) {
         return next(unauthorized("Invalid API key."));
       }

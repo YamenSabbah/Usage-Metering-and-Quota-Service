@@ -30,15 +30,18 @@ export type ConsumptionDecision = {
 /**
  * Concurrency strategy
  * ────────────────────
- * We use a Prisma interactive transaction with SERIALIZABLE isolation plus explicit
- * `SELECT ... FOR UPDATE` row locks on the account+month and user+month usage rows.
+ * We use a Prisma interactive transaction with READ COMMITTED isolation (the PostgreSQL
+ * default) plus explicit `SELECT ... FOR UPDATE` row locks on the account+month and
+ * user+month usage rows.
+ *
+ * READ COMMITTED + FOR UPDATE is sufficient here because:
+ *  - The FOR UPDATE lock serializes competing transactions on the same usage row.
+ *  - The conditional UPDATE (consumedUnits = :expected) provides a second safety net.
+ *  - SERIALIZABLE would add unnecessary conflict detection on top of the explicit locks,
+ *    causing serialization failures (40001) under high concurrency that require retries.
  *
  * Lock order (always account first, then user) prevents deadlocks between two requests
  * for different users sharing one account.
- *
- * The actual usage increment uses a conditional UPDATE (consumedUnits = :expected) as a
- * second safety net. If the predicate fails, the request is rejected. This guards against
- * any remaining anomaly even though the FOR UPDATE path should be sufficient.
  *
  * Idempotency is enforced by a DB unique constraint on (accountId, requestId). Duplicate
  * requests return the original recorded decision without consuming additional units.
@@ -53,13 +56,18 @@ export async function processConsumption(
   requestId: string,
 ): Promise<ConsumptionDecision> {
   const { year, month } = utcYearMonth();
-  const maxRetries = 2;
+  const maxRetries = 3;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      return await prisma.$transaction(async (tx) => {
-        return await decideAndRecord(tx, accountId, userId, requestedUnits, requestId, year, month);
-      }, { isolationLevel: "Serializable" });
+      return await prisma.$transaction(
+        async (tx) => {
+          return await decideAndRecord(tx, accountId, userId, requestedUnits, requestId, year, month);
+        },
+        // Prisma's defaults (maxWait 2s) turn a brief pool queue into a P2028
+        // error. Waiting longer converts those hard failures into latency.
+        { maxWait: 15_000, timeout: 20_000 },
+      );
     } catch (err: unknown) {
       if (attempt < maxRetries && isRetryableDBError(err) && !isBusinessError(err)) {
         continue;
@@ -96,47 +104,38 @@ async function decideAndRecord(
   }
 
   // --- Lock + load account usage for the current UTC month ---
-  let accountUsage = await tx.accountUsage.findUnique({
-    where: { accountId_year_month: { accountId, year, month } },
-  });
-
-  if (!accountUsage) {
-    accountUsage = await tx.accountUsage.create({
-      data: { accountId, year, month, consumedUnits: 0 },
-    });
-  }
-
-  // Explicit row lock — serializes concurrent consumption for the same account+month.
+  // Use INSERT ... ON CONFLICT DO NOTHING to atomically create the row if missing.
+  // This avoids a race where multiple concurrent transactions all try to create
+  // the same (accountId, year, month) row and hit the unique constraint.
   await tx.$executeRaw`
-    SELECT 1 FROM "AccountUsage"
+    INSERT INTO "AccountUsage" ("accountId", "year", "month", "consumedUnits")
+    VALUES (${accountId}, ${year}, ${month}, 0)
+    ON CONFLICT ("accountId", "year", "month") DO NOTHING
+  `;
+
+  // Lock and read in one statement. This serializes concurrent consumption for
+  // the same account+month regardless of whether the row was just created.
+  const accountRows = await tx.$queryRaw<Array<{ id: number; consumedUnits: number }>>`
+    SELECT "id", "consumedUnits" FROM "AccountUsage"
     WHERE "accountId" = ${accountId} AND "year" = ${year} AND "month" = ${month}
     FOR UPDATE
   `;
-
-  // Re-read after acquiring the lock to get the latest committed state.
-  accountUsage = await tx.accountUsage.findUnique({
-    where: { id: accountUsage.id },
-  });
+  const accountUsage = accountRows[0];
   if (!accountUsage) throw new Error("accountUsage row vanished under lock");
 
   // --- Lock + load user usage for the current UTC month ---
-  let userUsage = await tx.userUsage.findUnique({
-    where: { userId_year_month: { userId, year, month } },
-  });
-
-  if (!userUsage) {
-    userUsage = await tx.userUsage.create({
-      data: { userId, year, month, consumedUnits: 0 },
-    });
-  }
-
   await tx.$executeRaw`
-    SELECT 1 FROM "UserUsage"
+    INSERT INTO "UserUsage" ("userId", "year", "month", "consumedUnits")
+    VALUES (${userId}, ${year}, ${month}, 0)
+    ON CONFLICT ("userId", "year", "month") DO NOTHING
+  `;
+
+  const userRows = await tx.$queryRaw<Array<{ id: number; consumedUnits: number }>>`
+    SELECT "id", "consumedUnits" FROM "UserUsage"
     WHERE "userId" = ${userId} AND "year" = ${year} AND "month" = ${month}
     FOR UPDATE
   `;
-
-  userUsage = await tx.userUsage.findUnique({ where: { id: userUsage.id } });
+  const userUsage = userRows[0];
   if (!userUsage) throw new Error("userUsage row vanished under lock");
 
   // --- Load account + user rows and plans ---
@@ -146,12 +145,16 @@ async function decideAndRecord(
   });
   if (!accountRow) throw new Error("account not found");
 
-  const userRow = await tx.user.findUnique({ where: { id: userId } });
+  // One round trip instead of two: the user's plan comes back with the user.
+  const userRow = await tx.user.findUnique({
+    where: { id: userId },
+    include: { plan: true },
+  });
   if (!userRow || userRow.accountId !== accountId) {
     throw unprocessable("User not found or not accessible.");
   }
 
-  const userPlanRow = await tx.plan.findUnique({ where: { id: userRow.planId } });
+  const userPlanRow = userRow.plan;
   if (!userPlanRow) throw new Error("user plan not found");
 
   const accountPlan = accountRow.plan;
@@ -312,8 +315,10 @@ async function decideAndRecord(
     },
   });
 
-  const updatedAccountUsage = await tx.accountUsage.findUnique({ where: { id: accountUsage.id } });
-  const updatedUserUsage = await tx.userUsage.findUnique({ where: { id: userUsage.id } });
+  // The increments above happened under the row locks, so the new totals are
+  // exactly before + requestedUnits — no need to read them back.
+  const accountConsumedAfter = accountUsedBefore + requestedUnits;
+  const userConsumedAfter = userUsedBefore + requestedUnits;
 
   return {
     accepted: true,
@@ -325,16 +330,16 @@ async function decideAndRecord(
       planId: accountPlan.id,
       planName: accountPlan.name,
       monthlyAllowance: accountPlan.monthlyAllowance,
-      consumedUnits: updatedAccountUsage!.consumedUnits,
-      remaining: Math.max(0, accountPlan.monthlyAllowance - updatedAccountUsage!.consumedUnits),
+      consumedUnits: accountConsumedAfter,
+      remaining: Math.max(0, accountPlan.monthlyAllowance - accountConsumedAfter),
       maxPerRequest: accountPlan.maxPerRequest,
     },
     user: {
       planId: userPlan.id,
       planName: userPlan.name,
       monthlyAllowance: userPlan.monthlyAllowance,
-      consumedUnits: updatedUserUsage!.consumedUnits,
-      remaining: Math.max(0, userPlan.monthlyAllowance - updatedUserUsage!.consumedUnits),
+      consumedUnits: userConsumedAfter,
+      remaining: Math.max(0, userPlan.monthlyAllowance - userConsumedAfter),
       maxPerRequest: userPlan.maxPerRequest,
     },
   };
@@ -449,17 +454,32 @@ function decodeRecordedDecision(rec: {
 
 function isRetryableDBError(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
+  const e = err as Record<string, unknown>;
+
+  // Check the error's own code property (Prisma error codes).
+  // P2034 = transaction conflict / deadlock (retryable).
+  // P2002 = unique constraint violation — on the (accountId, requestId) idempotency
+  // key this means another concurrent transaction already recorded the decision.
+  // Retrying lets the idempotency check at the top of decideAndRecord() find the
+  // existing record and return it. Other unique constraint violations will fail
+  // again on retry and eventually throw.
+  if (e["code"] === "P2034" || e["code"] === "P2002") return true;
+
+  // Check the error message for PostgreSQL serialization failure indicators.
+  // Prisma wraps raw query errors with the SQL state in the message.
+  const msg = String(e["message"] ?? "");
+  if (msg.includes("40001") || msg.includes("40P01") || msg.includes("could not serialize") || msg.includes("deadlock detected")) {
+    return true;
+  }
+
+  // Walk the cause chain looking for the SQL state on nested errors.
   let current: unknown = err;
   for (let i = 0; i < 5; i++) {
     if (!current || typeof current !== "object") break;
     const c = current as Record<string, unknown>;
-    const pgError = c["cause"] ?? c["original"] ?? c["driverError"] ?? c["pgError"];
-    if (pgError && typeof pgError === "object") {
-      const d = pgError as Record<string, unknown>;
-      const sqlState = d["code"] ?? d["sqlState"];
-      if (sqlState === "40001" || sqlState === "40P01") return true;
-    }
-    current = c["cause"] ?? c["original"] ?? c["driverError"];
+    const sqlState = c["code"] ?? c["sqlState"];
+    if (sqlState === "40001" || sqlState === "40P01") return true;
+    current = c["cause"] ?? c["original"] ?? c["driverError"] ?? c["pgError"];
   }
   return false;
 }

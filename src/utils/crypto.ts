@@ -29,7 +29,7 @@ export async function hashApiKey(plaintext: string): Promise<string> {
  */
 export async function verifyApiKey(plaintext: string, hash: string): Promise<boolean> {
   try {
-    return argon2.verify(hash, plaintext);
+    return await argon2.verify(hash, plaintext);
   } catch {
     return false;
   }

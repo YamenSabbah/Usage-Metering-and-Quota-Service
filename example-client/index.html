@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Usage Metering Demo</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --green:#4ade80; --red:#f87171; --yellow:#facc15; --border:#334155; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font:14px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--text); padding:20px; }
+  h1 { font-size:20px; margin-bottom:16px; }
+  h2 { font-size:15px; margin-bottom:10px; color:var(--accent); }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:16px; }
+  .full { grid-column:1/-1; }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  input,select,button { font:14px system-ui,sans-serif; padding:8px 12px; border-radius:6px; border:1px solid var(--border); background:#0f172a; color:var(--text); width:100%; margin-bottom:10px; }
+  button { cursor:pointer; background:var(--accent); color:#0f172a; font-weight:600; border:none; width:auto; }
+  button:hover { opacity:.85; }
+  button.red { background:var(--red); }
+  .row { display:flex; gap:10px; align-items:end; }
+  .row > div { flex:1; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-weight:500; }
+  .accept { color:var(--green); }
+  .reject { color:var(--red); }
+  .bar-bg { background:#334155; border-radius:4px; height:16px; overflow:hidden; }
+  .bar-fill { height:100%; border-radius:4px; transition:width .3s; }
+  .muted { color:var(--muted); font-size:12px; }
+  .mono { font-family:monospace; font-size:12px; word-break:break-all; }
+  #log { max-height:300px; overflow-y:auto; font-family:monospace; font-size:12px; }
+  .log-entry { padding:4px 0; border-bottom:1px solid var(--border); }
+</style>
+</head>
+<body>
+<h1>📊 Usage Metering &amp; Quota Service — Demo</h1>
+
+<!-- Setup -->
+<div class="grid">
+  <div class="card">
+    <h2>1 · Setup</h2>
+    <label>API base URL</label>
+    <input id="baseUrl" value="http://localhost:3000" />
+    <div class="row">
+      <div>
+        <label>Account name</label>
+        <input id="acctName" value="Demo Corp" />
+      </div>
+      <div style="flex:0 0 auto"><button id="btnCreateAcct">Create Account</button></div>
+    </div>
+    <label>API Key (from account creation)</label>
+    <input id="apiKey" placeholder="Paste API key here or click Create Account" />
+    <div class="muted">This key is stored in memory only — never sent anywhere except the API.</div>
+  </div>
+
+  <div class="card">
+    <h2>2 · Users</h2>
+    <div class="row">
+      <div>
+        <label>External Ref</label>
+        <input id="userRef" value="alice" />
+      </div>
+      <div>
+        <label>Plan</label>
+        <select id="userPlan"></select>
+      </div>
+      <div style="flex:0 0 auto"><button id="btnAddUser">Add User</button></div>
+    </div>
+    <div id="userList" class="muted">No users yet.</div>
+  </div>
+
+  <!-- Account overview -->
+  <div class="card">
+    <h2>3 · Account Usage (shared allowance)</h2>
+    <div id="acctInfo" class="muted">—</div>
+    <div class="bar-bg" style="margin-top:8px"><div id="acctBar" class="bar-fill" style="width:0%;background:var(--green)"></div></div>
+    <div id="acctDetail" class="muted" style="margin-top:4px"></div>
+  </div>
+
+  <!-- User usage -->
+  <div class="card">
+    <h2>4 · User Usage (individual)</h2>
+    <div id="userUsageBox" class="muted">Select a user to see usage.</div>
+  </div>
+
+  <!-- Consume -->
+  <div class="card">
+    <h2>5 · Consume Units</h2>
+    <div class="row">
+      <div>
+        <label>User</label>
+        <select id="consumeUser"></select>
+      </div>
+      <div>
+        <label>Units</label>
+        <input id="consumeUnits" type="number" value="10" min="1" />
+      </div>
+      <div>
+        <label>Request ID</label>
+        <input id="consumeReqId" />
+      </div>
+      <div style="flex:0 0 auto"><button id="btnConsume">Consume</button></div>
+    </div>
+    <div id="consumeResult" class="muted">—</div>
+  </div>
+
+  <!-- Quick actions -->
+  <div class="card">
+    <h2>6 · Quick Scenarios</h2>
+    <div class="row" style="flex-wrap:wrap">
+      <div><button id="btnAccept" style="width:100%">✓ Accept</button></div>
+      <div><button id="btnOverPerReq" class="red" style="width:100%">✗ Over Per-Request</button></div>
+      <div><button id="btnOverMonthly" class="red" style="width:100%">✗ Over Monthly</button></div>
+      <div><button id="btnFlood" style="width:100%">⚡ Flood Account</button></div>
+      <div><button id="btnSwitchPlan" style="width:100%">🔄 Switch User Plan</button></div>
+      <div><button id="btnRefresh" style="width:100%">🔄 Refresh</button></div>
+    </div>
+  </div>
+
+  <!-- History -->
+  <div class="card full">
+    <h2>7 · Request History</h2>
+    <div style="max-height:300px;overflow-y:auto">
+      <table>
+        <thead><tr><th>Time</th><th>Req ID</th><th>User</th><th>Units</th><th>Result</th><th>Reason</th></tr></thead>
+        <tbody id="historyBody"><tr><td colspan="6" class="muted">No history yet.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="card full">
+    <h2>Activity Log</h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let users = [];
+
+function log(msg, cls = "") {
+  const el = document.createElement("div");
+  el.className = "log-entry " + cls;
+  el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  $("log").prepend(el);
+}
+
+function api(method, path, body) {
+  const url = $("baseUrl").value.replace(/\/$/, "") + path;
+  const headers = { "Content-Type": "application/json" };
+  const key = $("apiKey").value.trim();
+  if (key) headers["X-API-Key"] = key;
+  return fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined })
+    .then(r => r.json().then(d => ({ status: r.status, data: d })));
+}
+
+function renderUsers() {
+  const sel = $("consumeUser");
+  sel.innerHTML = users.map(u => `<option value="${u.id}">${u.externalRef} (#${u.id})</option>`).join("");
+  $("userList").innerHTML = users.length
+    ? users.map(u => `<div style="padding:2px 0">#${u.id} <b>${u.externalRef}</b> — plan: ${u.planName}</div>`).join("")
+    : "No users yet.";
+}
+
+async function refreshAccount() {
+  try {
+    const r = await api("GET", "/accounts/me");
+    if (r.status !== 200) return;
+    const a = r.data;
+    const u = await api("GET", "/usage/current");
+    if (u.status === 200) {
+      const pct = u.data.plan.monthlyAllowance > 0 ? (u.data.consumedUnits / u.data.plan.monthlyAllowance * 100) : 0;
+      $("acctInfo").innerHTML = `<b>${a.name}</b> · plan <b>${a.planName}</b> (${a.monthlyAllowance.toLocaleString()} units/mo)`;
+      $("acctBar").style.width = pct + "%";
+      $("acctBar").style.background = pct > 90 ? "var(--red)" : pct > 70 ? "var(--yellow)" : "var(--green)";
+      $("acctDetail").textContent = `${u.data.consumedUnits.toLocaleString()} used · ${u.data.remaining.toLocaleString()} remaining`;
+    }
+  } catch (e) { log("Refresh error: " + e.message, "reject"); }
+}
+
+async function refreshUserUsage(userId) {
+  try {
+    const u = await api("GET", `/usage/users/${userId}`);
+    const user = users.find(x => x.id == userId);
+    if (!user) return;
+    const box = $("userUsageBox");
+    if (u.status === 200 && u.data) {
+      const pct = user.monthlyAllowance > 0 ? (u.data.consumedUnits / user.monthlyAllowance * 100) : 0;
+      box.innerHTML = `
+        <b>${user.externalRef}</b> · plan <b>${user.planName}</b> (${user.monthlyAllowance.toLocaleString()} units/mo, max ${user.maxPerRequest}/req)
+        <div class="bar-bg" style="margin-top:6px"><div style="width:${Math.min(pct,100)}%;height:100%;border-radius:4px;background:${pct>90?"var(--red)":pct>70?"var(--yellow)":"var(--green)"}"></div></div>
+        <div class="muted" style="margin-top:4px">${u.data.consumedUnits.toLocaleString()} used · ${(user.monthlyAllowance - u.data.consumedUnits).toLocaleString()} remaining</div>`;
+    } else {
+      box.innerHTML = `<b>${user.externalRef}</b> · ${user.planName} — 0 used`;
+    }
+  } catch (e) { /* ignore */ }
+}
+
+async function refreshHistory() {
+  try {
+    const r = await api("GET", "/history?limit=50");
+    if (r.status !== 200) return;
+    const rows = r.data.data.map(h => {
+      const t = new Date(h.processedAt).toLocaleTimeString();
+      const uid = h.userId;
+      const result = h.accepted ? '<span class="accept">✓ accepted</span>' : '<span class="reject">✗ rejected</span>';
+      const reason = h.rejectionCode || "—";
+      return `<tr><td>${t}</td><td class="mono">${h.requestId}</td><td>#${uid}</td><td>${h.requestedUnits}</td><td>${result}</td><td>${reason}</td></tr>`;
+    }).join("");
+    $("historyBody").innerHTML = rows || '<tr><td colspan="6" class="muted">No history.</td></tr>';
+  } catch (e) { /* ignore */ }
+}
+
+async function loadPlans() {
+  try {
+    const r = await api("GET", "/plans?scope=USER&source=PREDEFINED");
+    if (r.status === 200) {
+      $("userPlan").innerHTML = r.data.data.map(p =>
+        `<option value="${p.id}">${p.name} (${p.monthlyAllowance}/mo, max ${p.maxPerRequest})</option>`
+      ).join("");
+    }
+  } catch (e) { /* ignore */ }
+}
+
+// ── Actions ──
+
+$("btnCreateAcct").onclick = async () => {
+  // Use the form field, not prompt(): prompt() is blocked in embedded/sandboxed
+  // browser contexts, which silently broke this button.
+  const name = ($("acctName").value || "").trim() || "Demo Corp";
+  const r = await api("POST", "/accounts", { name });
+  if (r.status === 201) {
+    $("apiKey").value = r.data.apiKey;
+    log(`Account created: ${r.data.name} (id ${r.data.id})`);
+    log(`API key: ${r.data.apiKey}`);
+    loadPlans();
+    refreshAccount();
+  } else {
+    log("Account creation failed: " + JSON.stringify(r.data), "reject");
+  }
+};
+
+$("btnAddUser").onclick = async () => {
+  const ref = $("userRef").value.trim();
+  if (!ref) return;
+  const planId = parseInt($("userPlan").value);
+  const r = await api("POST", "/users", { externalRef: ref, planId });
+  if (r.status === 201) {
+    log(`User "${ref}" created (id ${r.data.id})`);
+    // Fetch the full user to get plan info
+    const g = await api("GET", `/users/${r.data.id}`);
+    users.push(g.data || { id: r.data.id, externalRef: ref, planName: "?", monthlyAllowance: 0, maxPerRequest: 0 });
+    renderUsers();
+    refreshAccount();
+    if (users.length === 1) refreshUserUsage(users[0].id);
+  } else {
+    log("User creation failed: " + JSON.stringify(r.data), "reject");
+  }
+};
+
+$("btnConsume").onclick = async () => {
+  const uid = parseInt($("consumeUser").value);
+  const units = parseInt($("consumeUnits").value);
+  const rid = $("consumeReqId").value.trim() || "req-" + Date.now();
+  if (!uid || !units) return;
+
+  const r = await api("POST", "/consume", { userId: uid, units, requestId: rid });
+  const d = r.data;
+  if (d.accepted) {
+    $("consumeResult").innerHTML = `<span class="accept">✓ Accepted ${d.unitsConsumed} units</span> — acct remaining: ${d.account.remaining.toLocaleString()}, user remaining: ${d.user.remaining.toLocaleString()}`;
+    log(`Consume ${units} units for user #${uid} → ACCEPTED`);
+  } else {
+    $("consumeResult").innerHTML = `<span class="reject">✗ Rejected: ${d.rejectionCode}</span> (scope: ${d.rejectionScope})`;
+    log(`Consume ${units} units for user #${uid} → REJECTED (${d.rejectionCode})`, "reject");
+  }
+  refreshAccount();
+  if (uid) refreshUserUsage(uid);
+  refreshHistory();
+};
+
+// Quick scenarios
+$("btnAccept").onclick = () => { $("consumeUnits").value = 10; $("btnConsume").click(); };
+$("btnOverPerReq").onclick = () => { $("consumeUnits").value = 9999; $("btnConsume").click(); };
+$("btnOverMonthly").onclick = async () => {
+  const uid = parseInt($("consumeUser").value);
+  if (!uid) return;
+  // Consume until monthly limit hit
+  for (let i = 0; i < 5; i++) {
+    $("consumeUnits").value = 200;
+    $("consumeReqId").value = "flood-" + Date.now() + "-" + i;
+    await $("btnConsume").click();
+    await new Promise(r => setTimeout(r, 100));
+  }
+};
+$("btnFlood").onclick = async () => {
+  const uid = parseInt($("consumeUser").value);
+  if (!uid) return;
+  log("Flooding with 30 parallel requests of 20 units...");
+  const promises = Array.from({ length: 30 }, (_, i) =>
+    api("POST", "/consume", { userId: uid, units: 20, requestId: "flood-" + Date.now() + "-" + i })
+  );
+  const results = await Promise.all(promises);
+  const accepted = results.filter(r => r.data && r.data.accepted).length;
+  log(`Flood done: ${accepted} accepted, ${30 - accepted} rejected`);
+  refreshAccount();
+  refreshUserUsage(uid);
+  refreshHistory();
+};
+$("btnSwitchPlan").onclick = async () => {
+  const uid = parseInt($("consumeUser").value);
+  if (!uid || !users.length) return;
+  const current = users.find(u => u.id == uid);
+  // Toggle between first two USER plans
+  const plansRes = await api("GET", "/plans?scope=USER");
+  const plans = plansRes.data.data;
+  if (plans.length < 2) return;
+  const curIdx = plans.findIndex(p => p.name === current.planName);
+  const next = plans[(curIdx + 1) % plans.length];
+  const r = await api("PUT", `/users/${uid}/plan`, { planId: next.id });
+  if (r.status === 200) {
+    log(`Switched user #${uid} to plan "${next.name}" (${next.monthlyAllowance}/mo, max ${next.maxPerRequest})`);
+    // Refresh user info
+    const g = await api("GET", `/users/${uid}`);
+    if (g.status === 200) {
+      const idx = users.findIndex(u => u.id == uid);
+      users[idx] = g.data;
+      renderUsers();
+      refreshUserUsage(uid);
+    }
+  }
+};
+$("btnRefresh").onclick = () => { refreshAccount(); refreshHistory(); };
+
+// Init
+loadPlans();
+refreshAccount();
+refreshHistory();
+</script>
+</body>
+</html>

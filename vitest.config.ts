@@ -7,11 +7,8 @@ export default defineConfig({
     testTimeout: 30000,
     hookTimeout: 30000,
     // DB tests must run sequentially to avoid lock contention.
-    // Concurrency tests within a single file still run in parallel via Promise.all.
     fileParallelism: false,
     pool: "forks",
-    poolOptions: {
-      forks: { singleFork: true },
-    },
+    isolate: true,
   },
 });

@@ -1,2 +1,6 @@
 node_modules
-/generated/prisma
+/generated
+dist
+.env
+.env.local
+*.log

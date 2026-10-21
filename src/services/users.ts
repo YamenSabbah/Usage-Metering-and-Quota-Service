@@ -1,5 +1,6 @@
 import { PrismaClient } from "../../generated/prisma/client";
-import { notFound, forbidden } from "../middleware/errors";
+import { notFound, forbidden, conflict } from "../middleware/errors";
+import { isUniqueViolation } from "../lib/prisma-errors";
 
 export type UserSummary = {
   id: number;
@@ -50,13 +51,22 @@ export async function createUser(
     throw notFound("Plan not found.");
   }
 
-  const user = await prisma.user.create({
-    data: {
-      externalRef: input.externalRef,
-      accountId,
-      planId,
-    },
-  });
+  let user;
+  try {
+    user = await prisma.user.create({
+      data: {
+        externalRef: input.externalRef,
+        accountId,
+        planId,
+      },
+    });
+  } catch (err) {
+    // (accountId, externalRef) is unique — a duplicate is a client conflict, not a 500.
+    if (isUniqueViolation(err)) {
+      throw conflict(`A user with externalRef '${input.externalRef}' already exists in this account.`);
+    }
+    throw err;
+  }
 
   return { id: user.id, externalRef: user.externalRef, planId: user.planId };
 }

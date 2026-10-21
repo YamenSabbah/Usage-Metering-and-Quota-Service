@@ -1,5 +1,6 @@
 import { PrismaClient } from "../../generated/prisma/client";
-import { notFound, forbidden } from "../middleware/errors";
+import { notFound, forbidden, conflict } from "../middleware/errors";
+import { isUniqueViolation } from "../lib/prisma-errors";
 
 export type PlanSummary = {
   id: number;
@@ -107,16 +108,25 @@ export async function createPlan(
   accountId: number,
   input: CreatePlanInput,
 ): Promise<PlanSummary> {
-  const plan = await prisma.plan.create({
-    data: {
-      name: input.name,
-      scope: input.scope,
-      monthlyAllowance: input.monthlyAllowance,
-      maxPerRequest: input.maxPerRequest,
-      source: "CUSTOM",
-      accountId,
-    },
-  });
+  let plan;
+  try {
+    plan = await prisma.plan.create({
+      data: {
+        name: input.name,
+        scope: input.scope,
+        monthlyAllowance: input.monthlyAllowance,
+        maxPerRequest: input.maxPerRequest,
+        source: "CUSTOM",
+        accountId,
+      },
+    });
+  } catch (err) {
+    // (name, scope, accountId) is unique — a duplicate custom plan is a 409.
+    if (isUniqueViolation(err)) {
+      throw conflict(`A custom ${input.scope.toLowerCase()} plan named '${input.name}' already exists.`);
+    }
+    throw err;
+  }
 
   return {
     id: plan.id,
