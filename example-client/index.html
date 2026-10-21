@@ -114,6 +114,7 @@
       <div><button id="btnOverMonthly" class="red" style="width:100%">✗ Over Monthly</button></div>
       <div><button id="btnFlood" style="width:100%">⚡ Flood Account</button></div>
       <div><button id="btnSwitchPlan" style="width:100%">🔄 Switch User Plan</button></div>
+      <div><button id="btnSwitchAcctPlan" style="width:100%">🔁 Switch Account Plan</button></div>
       <div><button id="btnRefresh" style="width:100%">🔄 Refresh</button></div>
     </div>
   </div>
@@ -139,6 +140,7 @@
 <script>
 const $ = id => document.getElementById(id);
 let users = [];
+let acctPlan = null; // account plan info from /accounts/me, used for unit math
 
 function log(msg, cls = "") {
   const el = document.createElement("div");
@@ -172,7 +174,8 @@ async function refreshAccount() {
     const u = await api("GET", "/usage/current");
     if (u.status === 200) {
       const pct = u.data.plan.monthlyAllowance > 0 ? (u.data.consumedUnits / u.data.plan.monthlyAllowance * 100) : 0;
-      $("acctInfo").innerHTML = `<b>${a.name}</b> · plan <b>${a.planName}</b> (${a.monthlyAllowance.toLocaleString()} units/mo)`;
+      acctPlan = { planName: a.planName, monthlyAllowance: a.monthlyAllowance, maxPerRequest: a.maxPerRequest };
+      $("acctInfo").innerHTML = `<b>${a.name}</b> · plan <b>${a.planName}</b> (${a.monthlyAllowance.toLocaleString()} units/mo, max ${a.maxPerRequest}/req)`;
       $("acctBar").style.width = pct + "%";
       $("acctBar").style.background = pct > 90 ? "var(--red)" : pct > 70 ? "var(--yellow)" : "var(--green)";
       $("acctDetail").textContent = `${u.data.consumedUnits.toLocaleString()} used · ${u.data.remaining.toLocaleString()} remaining`;
@@ -268,12 +271,16 @@ $("btnConsume").onclick = async () => {
 
   const r = await api("POST", "/consume", { userId: uid, units, requestId: rid });
   const d = r.data;
+  // Full unit state straight from the decision — the page is "aware" of every unit.
+  const totals = d && d.account
+    ? ` · acct ${d.account.consumedUnits.toLocaleString()}/${d.account.monthlyAllowance.toLocaleString()} (${d.account.remaining.toLocaleString()} left) · user ${d.user.consumedUnits.toLocaleString()}/${d.user.monthlyAllowance.toLocaleString()} (${d.user.remaining.toLocaleString()} left)`
+    : "";
   if (d.accepted) {
     $("consumeResult").innerHTML = `<span class="accept">✓ Accepted ${d.unitsConsumed} units</span> — acct remaining: ${d.account.remaining.toLocaleString()}, user remaining: ${d.user.remaining.toLocaleString()}`;
-    log(`Consume ${units} units for user #${uid} → ACCEPTED`);
+    log(`Consume ${units} → ACCEPTED${totals}`);
   } else {
     $("consumeResult").innerHTML = `<span class="reject">✗ Rejected: ${d.rejectionCode}</span> (scope: ${d.rejectionScope})`;
-    log(`Consume ${units} units for user #${uid} → REJECTED (${d.rejectionCode})`, "reject");
+    log(`Consume ${units} → REJECTED (${d.rejectionCode}) · 0 consumed${totals}`, "reject");
   }
   refreshAccount();
   if (uid) refreshUserUsage(uid);
@@ -286,13 +293,29 @@ $("btnOverPerReq").onclick = () => { $("consumeUnits").value = 9999; $("btnConsu
 $("btnOverMonthly").onclick = async () => {
   const uid = parseInt($("consumeUser").value);
   if (!uid) return;
-  // Consume until monthly limit hit
-  for (let i = 0; i < 5; i++) {
-    $("consumeUnits").value = 200;
-    $("consumeReqId").value = "flood-" + Date.now() + "-" + i;
-    await $("btnConsume").click();
-    await new Promise(r => setTimeout(r, 100));
+  const user = users.find(u => u.id == uid);
+  // Units per request must pass BOTH per-request limits (account + user) so the
+  // rejection that eventually lands is a monthly one, not a per-request one.
+  let step = user && user.maxPerRequest ? user.maxPerRequest : 20;
+  if (acctPlan && acctPlan.maxPerRequest) step = Math.min(step, acctPlan.maxPerRequest);
+  log(`Draining monthly allowance with ${step}-unit requests until a monthly limit is hit...`);
+  let final = null;
+  for (let i = 0; i < 200; i++) {
+    const r = await api("POST", "/consume", { userId: uid, units: step, requestId: "drain-" + Date.now() + "-" + i });
+    if (!r.data || r.data.accepted === undefined) break;
+    if (!r.data.accepted) { final = r.data.rejectionCode; break; }
   }
+  if (final && final.includes("MONTHLY")) {
+    log(`Monthly limit reached → ${final}: allowance exhausted, further requests rejected`, "reject");
+    $("consumeResult").innerHTML = `<span class="reject">✗ ${final}</span> — allowance exhausted`;
+  } else if (final) {
+    log(`Drain stopped: ${final}`, "reject");
+  } else {
+    log("Drain finished without a monthly rejection (allowance too large for this run)");
+  }
+  refreshAccount();
+  refreshUserUsage(uid);
+  refreshHistory();
 };
 $("btnFlood").onclick = async () => {
   const uid = parseInt($("consumeUser").value);
@@ -331,6 +354,25 @@ $("btnSwitchPlan").onclick = async () => {
     }
   }
 };
+$("btnSwitchAcctPlan").onclick = async () => {
+  const me = await api("GET", "/accounts/me");
+  if (me.status !== 200) { log("Account plan switch failed: create/paste an API key first", "reject"); return; }
+  const plansRes = await api("GET", "/plans?scope=ACCOUNT");
+  const plans = (plansRes.data && plansRes.data.data) || [];
+  if (!plans.length) { log("No ACCOUNT-scope plans available", "reject"); return; }
+  const curIdx = plans.findIndex(p => p.name === me.data.planName);
+  const next = plans[(curIdx + 1) % plans.length];
+  const r = await api("PUT", "/account/plan", { planId: next.id });
+  if (r.status === 200) {
+    log(`Account plan ${me.data.planName} → ${next.name}: allowance ${me.data.monthlyAllowance.toLocaleString()} → ${next.monthlyAllowance.toLocaleString()}/mo, max/req ${me.data.maxPerRequest} → ${next.maxPerRequest}`);
+    log("Consumed units preserved — plan change only alters allowance/maxPerRequest");
+    await refreshAccount();
+    refreshHistory();
+  } else {
+    log("Account plan switch failed: " + JSON.stringify(r.data), "reject");
+  }
+};
+
 $("btnRefresh").onclick = () => { refreshAccount(); refreshHistory(); };
 
 // Init
